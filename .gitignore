@@ -1,0 +1,14 @@
+
+# Azure Functions artifacts
+bin
+obj
+appsettings.json
+local.settings.json
+__azurite*
+__blobstorage__
+__queuestorage__
+workflow-designtime/
+.debug
+.deploy/**/*.parameters.json
+.vs
+*.sqlproj.user

@@ -1,0 +1,11 @@
+{
+  "azureLogicAppsStandard.deploySubpath": "./logic-app",
+  "azureLogicAppsStandard.projectLanguage": "JavaScript",
+  "azureLogicAppsStandard.projectRuntime": "~3",
+  "debug.internalConsoleOptions": "neverOpen",
+  "azureFunctions.suppressProject": true,
+  "azure-pipelines.configure": true,
+  "files.associations": {
+        "**/.azure-pipelines/**/*.yml": "azure-pipelines"
+  }
+}

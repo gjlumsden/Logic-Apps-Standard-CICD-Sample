@@ -1,0 +1,161 @@
+trigger: none
+
+pr: none
+
+#TODO: Update with the Azure Service Connection and other values for your deployment
+variables:
+- name: azureServiceConnectionName
+  value: Logic-Apps-Service-Connection
+- name: resourceGroupName
+  value: logic-app-standard-cicd-sample-rg
+- name: appNamePrefix
+  value: lastdcicd
+- name: environmentChar
+  value: d #d, i, or p
+#IMPORTANT: Add a pipeline secret variable for sqlAdminPassword or ammend the template to retrieve from key vault (don't use an output!). The username is hard coded as dbUser.
+
+  
+pool: 
+  vmImage: ubuntu-latest
+
+stages:
+  - stage: build
+    displayName: "Publish Logic App and IaC"
+    jobs: 
+    - job: build_logic_app
+      displayName: "Build Logic App"
+      dependsOn: []
+      steps:
+
+      - task: CopyFiles@2
+        displayName: 'Prepare Deployment Files'
+        inputs:
+          SourceFolder: '$(System.DefaultWorkingDirectory)'
+          Contents: |
+            logic-app/**
+          TargetFolder: 'logic-output'
+
+      - task: ArchiveFiles@2
+        displayName: 'Create project zip'
+        inputs:
+          rootFolderOrFile: '$(System.DefaultWorkingDirectory)/logic-output/logic-app'
+          includeRootFolder: false
+          archiveType: 'zip'
+          archiveFile: '$(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip'
+          replaceExistingArchive: true
+
+      - publish: '$(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip'
+        displayName: 'Publish project zip artifact'
+        artifact: 'logic-app'
+
+    - job: publish_bicep
+      displayName: "Publish Bicep"
+      dependsOn: []
+      steps:
+
+      - task: CopyFiles@2
+        displayName: 'Copy Bicep templates'
+        inputs:
+          sourceFolder: '.deploy/.azure'
+          targetFolder: '$(Build.ArtifactStagingDirectory)'
+
+      - publish: '$(Build.ArtifactStagingDirectory)'
+        artifact: bicep-templates
+
+  - stage: deploy
+    displayName: "Deploy Infrastructure and Application"
+    jobs:
+
+    - deployment: deploy_azure_infrastructure
+      environment: PoC
+      displayName: "Deploy Infrastructure"
+      dependsOn: []
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+
+            - task: AzureResourceManagerTemplateDeployment@3
+              displayName: 'Deploy Infrastructure'
+              inputs:
+                resourceGroupName: $(resourceGroupName)
+                templateLocation: Linked artifact
+                csmFile: '$(Agent.BuildDirectory)/bicep-templates/main.bicep'
+                deploymentScope: Resource Group
+                azureResourceManagerConnection: $(azureServiceConnectionName)
+                location: uksouth
+                overrideParameters: -appNamePrefix $(appNamePrefix) -env $(environmentChar)  -sqlAdminPassword $(sqlAdminPassword)
+                deploymentMode: Incremental
+                deploymentOutputs: bicepOutputs
+                action: Create Or Update Resource Group
+
+            - pwsh: |
+                    $bicepOutput = '$(bicepOutputs)' | ConvertFrom-Json
+                    echo "##vso[task.setvariable variable=keyVaultName;isOutput=true]$($bicepOutput.keyVaultName.value)"
+                    echo "##vso[task.setvariable variable=subscriptionId;isOutput=true]$($bicepOutput.subscriptionId.value)"
+                    echo "##vso[task.setvariable variable=logicAppName;isOutput=true]$($bicepOutput.logicAppName.value)"
+              displayName: Extract Bicep Outputs
+              name: set_variables_from_bicep_outputs
+
+    - deployment: publish_logic_app
+      displayName: Publish Logic App
+      dependsOn: deploy_azure_infrastructure
+      environment: PoC
+      variables:
+      - name: logicAppName
+        value: $[ dependencies.deploy_azure_infrastructure.outputs['deploy_azure_infrastructure.set_variables_from_bicep_outputs.logicAppName'] ]
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+
+            - task: AzureFunctionApp@1
+              displayName: "Deploy Logic App"
+              inputs:
+                appName: $(logicAppName)
+                appType: functionApp
+                deploymentMethod: zipDeploy
+                package: $(Agent.BuildDirectory)/logic-app/$(Build.BuildId).zip
+                azureSubscription: $(azureServiceConnectionName)
+    
+    - deployment: set_workflow_secrets
+      displayName: Set Workflow Signature Secrets in Key Vault
+      dependsOn: 
+      - publish_logic_app
+      - deploy_azure_infrastructure
+      environment: PoC
+      variables:
+        - name: logicAppName
+          value: $[ dependencies.deploy_azure_infrastructure.outputs['deploy_azure_infrastructure.set_variables_from_bicep_outputs.logicAppName'] ]
+        - name: keyVaultName
+          value: $[ dependencies.deploy_azure_infrastructure.outputs['deploy_azure_infrastructure.set_variables_from_bicep_outputs.keyVaultName'] ]
+        - name: subscriptionId
+          value: $[ dependencies.deploy_azure_infrastructure.outputs['deploy_azure_infrastructure.set_variables_from_bicep_outputs.subscriptionId'] ]
+      
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+
+            - task: AzureCLI@2
+              displayName: Retrieve Workflow Names
+              inputs:
+                inlineScript: |
+                 $result = az rest --method get --url /subscriptions/$(subscriptionId)/resourceGroups/$(resourceGroupName)/providers/Microsoft.Web/sites/$(logicAppName)/hostruntime/runtime/webhooks/workflow/api/management/workflows?api-version=2018-11-01 --query "[?triggers.manual.kind==``Http``].{name:name}"
+                 $names = $result | ConvertFrom-Json | Select-Object -ExpandProperty name | ConvertTo-Json -Compress -AsArray
+                 echo "##vso[task.setvariable variable=workflowNames;]$($names)"
+                 echo $names
+                scriptType: pscore
+                azureSubscription: $(azureServiceConnectionName)
+                scriptLocation: inlineScript
+                
+            - task: AzureResourceManagerTemplateDeployment@3
+              displayName: 'Extract workflow signatures and add to key vault'
+              inputs:
+                templateLocation: Linked artifact
+                csmFile: '$(Agent.BuildDirectory)/bicep-templates/postdeploy.bicep'
+                deploymentScope: Subscription
+                azureResourceManagerConnection: $(azureServiceConnectionName)
+                location: uksouth
+                overrideParameters: -logicAppName $(logicAppName) -logicAppResourceGroup $(resourceGroupName) -keyVaultName $(keyVaultName) -keyVaultResourceGroup $(resourceGroupName) -workflowNames $(workflowNames)
+                deploymentMode: Incremental
